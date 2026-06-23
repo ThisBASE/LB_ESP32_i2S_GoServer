@@ -1,0 +1,184 @@
+// file: mainv1.ino đang chạy oki, chưa có điều khiển từ xa
+
+#include "Audio.h" // Thư viện ESP32-audioI2S
+#include <Arduino.h>
+#include <WiFi.h>
+
+// ================================================================
+//  CONFIG
+// ================================================================
+#define WIFI_SSID "TTBH"
+#define WIFI_PASS "motdenchin"
+
+// Đổi IP này thành IP máy chủ Node.js của bạn và tên file mp3 tương ứng
+#define STREAM_URL "http://192.168.0.123:8080/stream/0002.mp3"
+
+#define I2S_LRC 4 // Chính là chân WS
+#define I2S_BCLK 5
+#define I2S_DOUT 6
+// Phím bấm ở chân GPIO 0 (Thường là nút BOOT có sẵn trên mạch ESP32)
+#define BUTTON_PIN 0
+
+Audio audio;
+
+// ================================================================
+//  QUẢN LÝ TRẠNG THÁI (STATE MACHINE)
+// ================================================================
+volatile bool is_playing = false; // Cờ khóa hệ thống khi đang hát
+bool button_is_pressing = false;  // Trạng thái đang giữ nút
+uint32_t button_press_start = 0;  // Mốc thời gian bắt đầu nhấn
+
+#define TOUCH_PIN 2
+bool touchActive = false;
+unsigned long touchStartTime = 0;
+const unsigned long TOUCH_HOLD_TIME = 1000; // 1 giây giữ chạm
+bool touchPlayed = false;
+
+// Biến quản lý thời gian chờ sau khi hát xong
+uint32_t playback_end_time = 0;
+const uint32_t COOLDOWN_TIME = 2000; // 2 giây cooldown sau khi tắt nhạc
+
+// THÊM MỚI: Quản lý thời gian thả tay trong lúc hát
+uint32_t last_touch_time = 0;
+const uint32_t TOUCH_TIMEOUT = 3000; // 4 giây không chạm thì ngắt nhạc
+
+// ================================================================
+//  SETUP & LOOP
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // Cấu hình phím bấm (Sử dụng điện trở kéo lên, nhấn xuống là LOW)
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Khởi tạo chân cảm biến chạm
+  pinMode(TOUCH_PIN, INPUT);
+
+  // 1. Kết nối WiFi
+  Serial.printf("\n[WiFi] Đang kết nối tới %s...", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\n[WiFi] Đã kết nối! IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // 2. Cấu hình I2S
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(21);
+
+  Serial.println("\n[System] Sẵn sàng! Hãy NHẤN GIỮ phím BOOT (Pin 0) trong 1 giây để phát nhạc.");
+}
+
+bool is_first_loop = true;
+
+void loop() {
+  // BẮT BUỘC: Hàm này duy trì việc tải luồng mạng và giải mã âm thanh
+  audio.loop();
+
+  // -----------------------------------------------------------
+  // LOGIC ĐỌC CẢM BIẾN CHẠM
+  // -----------------------------------------------------------
+  // Luôn đọc trạng thái thực tế của chân cảm biến
+  bool current_touch_state = digitalRead(TOUCH_PIN);
+
+  if (is_playing) {
+    // 1. Nếu ĐANG PHÁT NHẠC -> Kiểm tra xem có đang chạm không
+    if (current_touch_state == HIGH) {
+      last_touch_time = millis(); // Nếu đang chạm, liên tục reset lại mốc thời gian
+    } else {
+      // Nếu KHÔNG chạm, kiểm tra xem đã qua 5 giây chưa
+      if (millis() - last_touch_time >= TOUCH_TIMEOUT) {
+        Serial.println("\n[System] Không phát hiện chạm quá 5 giây -> DỪNG NHẠC!");
+        audio.stopSong();             // Ngắt nhạc ngay lập tức
+        is_playing = false;           // Mở khóa cờ
+        playback_end_time = millis(); // Bắt đầu tính 5 giây cooldown chờ lần chạm mới
+      }
+    }
+
+    // Ép touchPlayed về false để không kích hoạt lệnh "Bắt đầu hát" ở logic bên dưới
+    touchPlayed = false;
+  } else if (millis() - playback_end_time < COOLDOWN_TIME) {
+    Serial.println("[System] Đang trong thời gian cooldown 5 giây sau khi tắt nhạc -> Chờ...");
+    // 2. Nhạc vừa tắt, nhưng chưa qua hết cooldown 5 giây -> Không nhận lệnh mới
+    touchPlayed = false;
+  } else {
+    // 3. Hệ thống rảnh rang và đã qua cooldown -> Sẵn sàng nhận lệnh kích hoạt hát
+    if (millis() > 10000) {
+      touchPlayed = current_touch_state;
+    }
+  }
+
+  // -----------------------------------------------------------
+  // LOGIC PHÁT NHẠC
+  // -----------------------------------------------------------
+  // Chỉ quét nút nhấn để BẮT ĐẦU nếu KHÔNG có nhạc đang phát
+  if (!is_playing) {
+
+    // Nút được nhấn (Mức LOW) hoặc Cảm biến chạm được kích hoạt (Mức HIGH)
+    if (digitalRead(BUTTON_PIN) == LOW || touchPlayed == HIGH) {
+      if (!button_is_pressing) {
+        // Mới bắt đầu nhấn -> Ghi nhận thời gian
+        button_is_pressing = true;
+        button_press_start = millis();
+        Serial.println("[Button/Touch] Đang nhấn giữ...");
+      } else {
+        // Đang giữ nút -> Kiểm tra xem đã đủ 1000ms (1 giây) chưa
+        if (millis() - button_press_start >= 1000) {
+          Serial.println("[Button/Touch] Đã giữ đủ 1 giây -> Bắt đầu phát nhạc!");
+
+          is_playing = true;          // Khóa không cho nhấn lại
+          button_is_pressing = false; // Reset trạng thái nút
+          touchPlayed = false;        // Reset ngay trạng thái chạm
+
+          // THÊM MỚI: Reset lại bộ đếm 5s thả tay ngay thời điểm bắt đầu hát
+          last_touch_time = millis();
+
+          audio.connecttohost(STREAM_URL); // Yêu cầu Server tải nhạc
+        }
+      }
+    }
+    // Nút được thả ra
+    else {
+      if (button_is_pressing) {
+        Serial.println("[Button/Touch] Đã thả (Chưa đủ 1 giây -> Hủy lệnh).");
+        button_is_pressing = false; // Xóa trạng thái, bắt đầu tính lại từ đầu
+      }
+    }
+  }
+}
+
+// ================================================================
+//  HÀM CALLBACK TỰ ĐỘNG CỦA THƯ VIỆN AUDIO
+// ================================================================
+
+// Hàm này tự động chạy khi ESP32 nhận được cờ kết thúc file mp3
+void audio_eof_mp3(const char *info) {
+  Serial.print("[Audio] Phát xong file: ");
+  Serial.println(info);
+  Serial.println("[System] Bắt đầu cooldown 5 giây trước khi cho chạm lại.\n");
+
+  is_playing = false;
+  playback_end_time = millis();
+}
+
+// (Tùy chọn) Bắt lỗi nếu link web bị chết hoặc rớt mạng giữa chừng
+void audio_info(const char *info) {
+  Serial.print("[Audio Info] ");
+  Serial.println(info);
+}
+
+// ================================================================
+// HÀM XỬ LÝ KHI KẾT THÚC LUỒNG MẠNG (WEB STREAM)
+// ================================================================
+void audio_eof_stream(const char *info) {
+  Serial.print("[Audio] Đã phát xong luồng stream: ");
+  Serial.println(info);
+
+  audio.stopSong();
+
+  Serial.println("[System] Bắt đầu cooldown 5 giây trước khi cho chạm lại.\n");
+
+  is_playing = false;
+  playback_end_time = millis();
+}

@@ -1,0 +1,28 @@
+{
+	"folders": [
+		{
+			"name": "esp32s3_PhoneCall_0626",
+			"path": "esp32s3_PhoneCall_0626"
+		},
+		{
+			"name": "ESP32_MAX98325",
+			"path": "ESP32_MAX98325"
+		},
+		{
+			"name": "LB_ESP32_S2_PhoneCall",
+			"path": "LB_ESP32_S2_PhoneCall"
+		},
+		{
+			"name": "music-server",
+			"path": "music-server"
+		},
+		{
+			"name": "music-server-go",
+			"path": "music-server-go"
+		},
+		{
+			"path": "music-server-go - v1"
+		}
+	],
+	"settings": {}
+}

@@ -1,0 +1,419 @@
+#include <Arduino.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <driver/i2s.h>
+
+// ================================================================
+//  CONFIG
+// ================================================================
+#define WIFI_SSID "Viettelbox"
+#define WIFI_PASS "Bao@123123"
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+
+#define SERVER_HOST "192.168.100.63"
+#define SERVER_PORT 8080
+#define DEFAULT_TRACK "0002.wav"
+
+#define SAMPLE_RATE 32000
+#define WAV_HEADER_SIZE 44
+
+#define I2S_BCLK_PIN 26
+#define I2S_WS_PIN 25
+#define I2S_DOUT_PIN 22
+
+// Giảm ring buffer xuống 32KB — vẫn đủ ~0.7s buffer
+// 64KB trên static global gây OOM với WiFi + HTTPClient
+#define RING_BUF_SIZE (48 * 1024)
+#define PREBUFFER_SIZE (24 * 1024) // 24KB = ~0.55s
+
+// HTTPClient đọc từng chunk nhỏ để tránh malloc lớn
+#define HTTP_READ_CHUNK 2048
+#define I2S_WRITE_CHUNK 512
+
+#define HTTP_TASK_CORE 0
+#define HTTP_TASK_PRIORITY 5
+#define HTTP_TASK_STACK 6144 // giảm từ 8192
+
+#define I2S_TASK_CORE 1
+#define I2S_TASK_PRIORITY 7
+#define I2S_TASK_STACK 3072 // giảm từ 4096
+
+#define STATUS_PRINT_MS 2000
+
+// ================================================================
+//  RING BUFFER
+//  Đặt trong DRAM với DRAM_ATTR để tránh cache issue
+// ================================================================
+static DRAM_ATTR uint8_t rb_buf[RING_BUF_SIZE];
+static volatile uint32_t rb_head = 0;
+static volatile uint32_t rb_tail = 0;
+
+static inline uint32_t rb_available() {
+  return (rb_head - rb_tail + RING_BUF_SIZE) % RING_BUF_SIZE;
+}
+
+static inline uint32_t rb_free_space() {
+  return RING_BUF_SIZE - rb_available() - 1;
+}
+
+static uint32_t rb_write(const uint8_t *data, uint32_t len) {
+  uint32_t written = 0;
+  uint32_t head = rb_head;
+
+  while (written < len) {
+    uint32_t fr = (RING_BUF_SIZE - ((head - rb_tail + RING_BUF_SIZE) % RING_BUF_SIZE) - 1);
+    if (fr == 0) break;
+
+    uint32_t to_end = RING_BUF_SIZE - head;
+    uint32_t chunk = min(min(len - written, fr), to_end);
+    memcpy(rb_buf + head, data + written, chunk);
+    head = (head + chunk) % RING_BUF_SIZE;
+    written += chunk;
+  }
+
+  rb_head = head;
+  return written;
+}
+
+static uint32_t rb_read(uint8_t *out, uint32_t len) {
+  uint32_t rd = 0;
+  uint32_t tail = rb_tail;
+
+  while (rd < len) {
+    uint32_t avail = (rb_head - tail + RING_BUF_SIZE) % RING_BUF_SIZE;
+    if (avail == 0) break;
+
+    uint32_t to_end = RING_BUF_SIZE - tail;
+    uint32_t chunk = min(min(len - rd, avail), to_end);
+    memcpy(out + rd, rb_buf + tail, chunk);
+    tail = (tail + chunk) % RING_BUF_SIZE;
+    rd += chunk;
+  }
+
+  rb_tail = tail;
+  return rd;
+}
+
+// ================================================================
+//  SHARED STATE
+// ================================================================
+static volatile bool g_stream_done = false;
+static volatile bool g_stream_error = false;
+static volatile bool g_prebuffered = false;
+static volatile uint32_t g_bytes_received = 0;
+static volatile uint32_t g_underrun_count = 0;
+
+typedef enum {
+  STATE_IDLE,
+  STATE_WAITING_PREBUFFER,
+  STATE_PLAYING,
+  STATE_UNDERRUN,
+  STATE_DONE,
+  STATE_ERROR
+} PlayerState;
+
+static volatile PlayerState g_player_state = STATE_IDLE;
+
+// ================================================================
+//  I2S INIT
+// ================================================================
+static void i2s_init() {
+  i2s_config_t cfg = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate = SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 6, // giảm từ 8 để tiết kiệm RAM
+      .dma_buf_len = 256, // giảm từ 512
+      .use_apll = true,
+      .tx_desc_auto_clear = true,
+      .fixed_mclk = 0,
+  };
+
+  i2s_pin_config_t pins = {
+      .bck_io_num = I2S_BCLK_PIN,
+      .ws_io_num = I2S_WS_PIN,
+      .data_out_num = I2S_DOUT_PIN,
+      .data_in_num = I2S_PIN_NO_CHANGE,
+  };
+
+  ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL));
+  ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_0, &pins));
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  Serial.printf("[I2S] Init OK: %dHz mono 16-bit | BCLK=%d WS=%d DOUT=%d\n",
+                SAMPLE_RATE, I2S_BCLK_PIN, I2S_WS_PIN, I2S_DOUT_PIN);
+}
+
+// ================================================================
+//  I2S TASK — core 1, priority 7
+// ================================================================
+static void i2s_task(void *param) {
+  // Stack-allocate nhỏ thôi vì I2S_WRITE_CHUNK = 512
+  uint8_t buf[I2S_WRITE_CHUNK];
+  size_t bytes_written;
+
+  g_player_state = STATE_WAITING_PREBUFFER;
+  Serial.printf("[I2S] Waiting pre-buffer (%d KB)...\n", PREBUFFER_SIZE / 1024);
+
+  while (!g_prebuffered && !g_stream_done && !g_stream_error) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  if (g_stream_error) {
+    g_player_state = STATE_ERROR;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  Serial.println("[I2S] Pre-buffer ready → phát!");
+  g_player_state = STATE_PLAYING;
+
+  while (true) {
+    uint32_t avail = rb_available();
+
+    if (avail >= I2S_WRITE_CHUNK) {
+      rb_read(buf, I2S_WRITE_CHUNK);
+      i2s_write(I2S_NUM_0, buf, I2S_WRITE_CHUNK, &bytes_written, pdMS_TO_TICKS(200));
+
+      if (g_player_state == STATE_UNDERRUN) {
+        Serial.println("[I2S] Recovered ✓");
+        g_player_state = STATE_PLAYING;
+      }
+
+    } else if (g_stream_done) {
+      if (avail > 0) {
+        uint32_t n = rb_read(buf, avail);
+        uint32_t padded = (n + 3) & ~3u;
+        memset(buf + n, 0, padded - n);
+        i2s_write(I2S_NUM_0, buf, padded, &bytes_written, pdMS_TO_TICKS(100));
+      }
+      break;
+
+    } else {
+      g_underrun_count++;
+      g_player_state = STATE_UNDERRUN;
+      if (g_underrun_count % 5 == 1) {
+        Serial.printf("[I2S] ⚠ UNDERRUN #%lu\n", g_underrun_count);
+      }
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(200));
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  g_player_state = STATE_DONE;
+  Serial.printf("[I2S] Done! Underruns: %lu\n", g_underrun_count);
+  vTaskDelete(NULL);
+}
+
+// ================================================================
+//  HTTP TASK — core 0, priority 5
+// ================================================================
+static void http_task(void *param) {
+  char url[128];
+  snprintf(url, sizeof(url), "http://%s:%d/stream/%s",
+           SERVER_HOST, SERVER_PORT, DEFAULT_TRACK);
+  Serial.printf("[HTTP] Connecting: %s\n", url);
+
+  // In free heap trước khi HTTPClient khởi tạo
+  Serial.printf("[MEM] Free heap before HTTP: %lu bytes\n", ESP.getFreeHeap());
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(10000);
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[HTTP] Error: %d\n", httpCode);
+    g_stream_error = true;
+    http.end();
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Lấy tổng dung lượng file từ server
+  int total_expected_size = http.getSize();
+  int total_bytes_read = 0; // Biến đếm tổng số byte đã tải
+
+  Serial.printf("[HTTP] OK! Size: %d bytes | Free heap: %lu\n",
+                total_expected_size, ESP.getFreeHeap());
+
+  WiFiClient *stream = http.getStreamPtr();
+
+  // Dùng static buffer trong task thay vì stack để tránh stack overflow
+  static uint8_t chunk[HTTP_READ_CHUNK];
+
+  bool header_skipped = false;
+  int header_bytes_counted = 0;
+
+  while (http.connected()) {
+    int available = stream->available();
+
+    if (available <= 0) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    int n = stream->readBytes(chunk, min(available, (int)sizeof(chunk)));
+    if (n <= 0) continue;
+    // Cộng dồn tổng số byte ĐÃ TẢI TỪ MẠNG
+    total_bytes_read += n;
+    uint8_t *data_ptr = chunk;
+    int data_len = n;
+
+    // Skip WAV header
+    if (!header_skipped) {
+      int remaining = WAV_HEADER_SIZE - header_bytes_counted;
+      if (data_len <= remaining) {
+        header_bytes_counted += data_len;
+        if (header_bytes_counted >= WAV_HEADER_SIZE) header_skipped = true;
+        continue;
+      }
+      data_ptr += remaining;
+      data_len -= remaining;
+      header_skipped = true;
+      Serial.println("[HTTP] WAV header skipped");
+    }
+
+    // Ghi vào ring buffer, đợi nếu đầy
+    uint32_t offset = 0;
+    while (offset < (uint32_t)data_len) {
+      uint32_t fr = rb_free_space();
+      if (fr > 0) {
+        offset += rb_write(data_ptr + offset,
+                           min((uint32_t)(data_len - offset), fr));
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(2));
+      }
+    }
+
+    g_bytes_received += data_len;
+
+    if (!g_prebuffered && rb_available() >= PREBUFFER_SIZE) {
+      g_prebuffered = true;
+      Serial.printf("[HTTP] Pre-buffer filled (%lu KB) | Free heap: %lu\n",
+                    g_bytes_received / 1024, ESP.getFreeHeap());
+    }
+    // Nếu đã tải đủ dữ liệu theo Content-Length của server -> Thoát ngay!
+    if (total_expected_size > 0 && total_bytes_read >= total_expected_size) {
+      Serial.println("[HTTP] Đã tải đủ 100% file, kết thúc luồng mạng!");
+      break;
+    }
+  }
+
+  http.end();
+  g_stream_done = true;
+  Serial.printf("[HTTP] Done. Total: %.1f KB\n", g_bytes_received / 1024.0f);
+  vTaskDelete(NULL);
+}
+
+// ================================================================
+//  WIFI
+// ================================================================
+static void wifi_connect() {
+  Serial.printf("[WiFi] Connecting to '%s'", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("\n[WiFi] Timeout! Restarting...");
+      ESP.restart();
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.printf("\n[WiFi] Connected! IP: %s | RSSI: %d dBm\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+}
+
+// ================================================================
+//  SETUP & LOOP
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n==============================");
+  Serial.println("   ESP32 WAV Music Streamer");
+  Serial.println("==============================");
+  Serial.printf("Free heap start : %lu bytes\n", ESP.getFreeHeap());
+  Serial.printf("Ring buffer     : %d KB\n", RING_BUF_SIZE / 1024);
+  Serial.printf("Pre-buffer      : %d KB\n", PREBUFFER_SIZE / 1024);
+
+  i2s_init();
+  Serial.printf("Free heap after I2S : %lu bytes\n", ESP.getFreeHeap());
+
+  wifi_connect();
+  Serial.printf("Free heap after WiFi: %lu bytes\n", ESP.getFreeHeap());
+
+  xTaskCreatePinnedToCore(http_task, "http", HTTP_TASK_STACK, NULL, HTTP_TASK_PRIORITY, NULL, HTTP_TASK_CORE);
+  xTaskCreatePinnedToCore(i2s_task, "i2s", I2S_TASK_STACK, NULL, I2S_TASK_PRIORITY, NULL, I2S_TASK_CORE);
+}
+
+void loop() {
+  static uint32_t last_print = 0;
+  uint32_t now = millis();
+
+  if (now - last_print < STATUS_PRINT_MS) {
+    delay(100);
+    return;
+  }
+  last_print = now;
+
+  float pct = 100.0f * rb_available() / RING_BUF_SIZE;
+  char bar[21] = "                    ";
+  for (int i = 0; i < (int)(pct / 5.0f) && i < 20; i++)
+    bar[i] = '#';
+
+  const char *state_str;
+  switch (g_player_state) {
+  case STATE_IDLE:
+    state_str = "IDLE";
+    break;
+  case STATE_WAITING_PREBUFFER:
+    state_str = "BUFFERING";
+    break;
+  case STATE_PLAYING:
+    state_str = "PLAYING";
+    break;
+  case STATE_UNDERRUN:
+    state_str = "UNDERRUN!!";
+    break;
+  case STATE_DONE:
+    state_str = "DONE";
+    break;
+  case STATE_ERROR:
+    state_str = "ERROR";
+    break;
+  default:
+    state_str = "?";
+    break;
+  }
+
+  Serial.printf("[%5lus] %-10s [%-20s]%4.0f%% buf:%2lu/%dKB rx:%4luKB heap:%luB rssi:%d ur:%lu\n",
+                now / 1000, state_str, bar, pct,
+                rb_available() / 1024, RING_BUF_SIZE / 1024,
+                g_bytes_received / 1024,
+                ESP.getFreeHeap(),
+                WiFi.RSSI(),
+                g_underrun_count);
+
+  if (g_player_state == STATE_DONE) {
+    Serial.println("[Main] Playback complete!");
+    while (true)
+      delay(1000);
+  }
+
+  if (g_player_state == STATE_ERROR || g_stream_error) {
+    Serial.println("[Main] ERROR! Restarting in 3s...");
+    delay(3000);
+    ESP.restart();
+  }
+}

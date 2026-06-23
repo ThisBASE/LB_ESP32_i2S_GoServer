@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Music Server</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d0d1a;color:#fff;min-height:100vh}
+.header{padding:16px;text-align:center;border-bottom:1px solid rgba(255,255,255,0.08)}
+.header h1{font-size:20px;margin-bottom:4px}
+.header .sub{font-size:12px;color:rgba(255,255,255,0.5)}
+.stats{display:flex;gap:8px;padding:12px 16px}
+.stat{flex:1;background:rgba(255,255,255,0.05);border-radius:10px;padding:12px;text-align:center}
+.stat .num{font-size:24px;font-weight:700}
+.stat .label{font-size:11px;color:rgba(255,255,255,0.5);margin-top:2px}
+.controls{padding:0 16px 12px;display:flex;gap:8px}
+.controls select{flex:1;padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.4);color:#fff;font-size:14px}
+.controls button{padding:14px 20px;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;white-space:nowrap}
+.btn-play{background:#4CAF50;color:#fff;min-width:80px}
+.btn-stop{background:#f44336;color:#fff;min-width:80px}
+h2{padding:12px 16px 6px;font-size:14px;color:rgba(255,255,255,0.5)}
+.device{padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:10px}
+.device .info{flex:1;min-width:0}
+.device .ip{font-size:15px;font-weight:600}
+.device .meta{font-size:12px;color:rgba(255,255,255,0.4);margin-top:3px}
+.badge{display:inline-block;padding:4px 10px;border-radius:8px;font-size:12px;font-weight:600}
+.badge-green{background:#4CAF50;color:#fff}
+.badge-blue{background:#2196F3;color:#fff}
+.badge-orange{background:#FF9800;color:#fff}
+.badge-gray{background:rgba(255,255,255,0.15);color:rgba(255,255,255,0.6)}
+.icon-ws{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.icon-ws.on{background:#4CAF50;box-shadow:0 0 6px #4CAF50}
+.icon-ws.off{background:rgba(255,255,255,0.2)}
+.dev-name{color:#fff;cursor:pointer}
+.dev-name:hover{text-decoration:underline;opacity:.8}
+.dev-sub{display:block;font-size:10px;color:rgba(255,255,255,0.25);margin-top:-1px}
+.device-actions{display:flex;gap:6px;align-items:center}
+.device-actions button{min-width:48px;min-height:48px;padding:0;border:none;border-radius:10px;font-size:20px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.device-actions button:active{transform:scale(0.92);opacity:.8}
+.mode-select{padding:8px 6px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.4);color:#fff;font-size:12px;cursor:pointer;min-height:36px}
+.empty{padding:40px;text-align:center;color:rgba(255,255,255,0.3);font-size:14px}
+.footer{text-align:center;padding:16px;font-size:11px;color:rgba(255,255,255,0.2)}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🎵 Music Stream Server</h1>
+  <div class="sub" id="serverInfo">Đang tải...</div>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="num" id="totalClients">0</div><div class="label">Tổng</div></div>
+  <div class="stat"><div class="num" id="playingClients" style="color:#4CAF50">0</div><div class="label">Đang phát</div></div>
+  <div class="stat"><div class="num" id="wsClients" style="color:#2196F3">0</div><div class="label">Điều khiển</div></div>
+</div>
+
+<div class="controls">
+  <select id="fileSelect"><option>Đang tải...</option></select>
+  <button class="btn-play" onclick="playAll()">▶ Tất cả</button>
+  <button class="btn-stop" onclick="stopAll()">⏹ Tất cả</button>
+</div>
+
+<h2>📡 Thiết bị</h2>
+<div id="deviceList"></div>
+
+<div class="footer">Music Server — Web Remote</div>
+
+<script>
+let serverIP = '';
+let deviceNames = {};
+let deviceModes = {};
+
+async function api(url, opts = {}) {
+  const resp = await fetch(url, opts);
+  if (!resp.ok) throw new Error(resp.statusText);
+  return resp;
+}
+
+async function loadInfo() {
+  try {
+    serverIP = await (await api('/api/localip')).text();
+    document.getElementById('serverInfo').textContent = `🌐 http://${serverIP}:8080`;
+  } catch(e) {}
+}
+
+async function loadFiles() {
+  try {
+    const files = await (await api('/api/files')).json();
+    const sel = document.getElementById('fileSelect');
+    sel.innerHTML = files.map(f => `<option value="${f.name}">${f.name}</option>`).join('');
+  } catch(e) {}
+}
+
+function renderDevices(list) {
+  const total = list.length;
+  const playing = list.filter(c => c.state === 'playing').length;
+  const ws = list.filter(c => c.type === 'ws').length;
+  document.getElementById('totalClients').textContent = total;
+  document.getElementById('playingClients').textContent = playing;
+  document.getElementById('wsClients').textContent = ws;
+
+  const el = document.getElementById('deviceList');
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty">Chưa có thiết bị nào</div>';
+    return;
+  }
+
+  el.innerHTML = list.map(c => {
+    const name = deviceNames[c.ip] || '';
+    const display = name || c.ip;
+    const stateBadge = stateLabel(c.state);
+    const stateCls = stateClass(c.state);
+    const isWS = c.type === 'ws';
+    const isPlaying = c.state === 'playing';
+    const file = c.file || '';
+    const mode = c.mode || 'hybrid';
+    return `
+      <div class="device">
+        <div class="info">
+          <div class="ip">
+            <span class="icon-ws ${isWS ? 'on' : 'off'}"></span>
+            <span class="dev-name" onclick="editName('${c.ip}')" title="Click đặt tên">${display}</span>
+            ${name ? `<span class="dev-sub">${c.ip}</span>` : ''}
+          </div>
+          <div class="meta">
+            <span class="badge badge-${stateCls}">${stateBadge}</span>
+            ${isWS ? ' <span style="color:rgba(255,255,255,0.4);font-size:11px">WS</span>' : ''}
+            ${file ? ' · ' + file : ''}
+          </div>
+        </div>
+        ${isWS ? `
+          <div class="device-actions">
+            <select class="mode-select" onchange="setMode('${c.ip}', this.value)">
+              <option value="hybrid" ${mode==='hybrid'?'selected':''}>Cả hai</option>
+              <option value="touch" ${mode==='touch'?'selected':''}>Chạm</option>
+              <option value="touch-play" ${mode==='touch-play'?'selected':''}>Chạm (k0 tự tắt)</option>
+              <option value="websocket" ${mode==='websocket'?'selected':''}>WebSocket</option>
+            </select>
+            <button style="background:#4CAF50;color:#fff" onclick="playDevice('${c.ip}')" ${isPlaying ? 'disabled' : ''}>▶</button>
+            <button style="background:#f44336;color:#fff" onclick="stopDevice('${c.ip}')" ${!isPlaying ? 'disabled' : ''}>⏹</button>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+async function loadNames() {
+  try {
+    deviceNames = await (await api('/api/names')).json();
+  } catch(e) {}
+}
+
+async function loadModes() {
+  try {
+    deviceModes = await (await api('/api/modes')).json();
+  } catch(e) {}
+}
+
+function setMode(ip, mode) {
+  api('/api/mode', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'ip='+encodeURIComponent(ip)+'&mode='+encodeURIComponent(mode)})
+    .then(() => loadModes())
+    .catch(console.error);
+}
+
+function editName(ip) {
+  const current = deviceNames[ip] || '';
+  const name = prompt('Đặt tên cho ' + ip, current);
+  if (name !== null) {
+    api('/api/name', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'ip='+encodeURIComponent(ip)+'&name='+encodeURIComponent(name)})
+      .then(() => loadNames())
+      .then(() => loadClients());
+  }
+}
+
+function stateLabel(s) {
+  switch(s) {
+    case 'connected': return 'Đã kết nối';
+    case 'playing': return 'Đang phát';
+    case 'stopped': return 'Đã ngắt';
+    default: return s;
+  }
+}
+
+function stateClass(s) {
+  switch(s) {
+    case 'connected': return 'blue';
+    case 'playing': return 'green';
+    case 'stopped': return 'orange';
+    default: return 'gray';
+  }
+}
+
+async function loadClients() {
+  try {
+    const list = await (await api('/api/clients')).json();
+    renderDevices(list);
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+function playAll() {
+  const file = document.getElementById('fileSelect').value;
+  if (!file) return;
+  api('/api/play-all', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'file='+encodeURIComponent(file)}).catch(console.error);
+}
+
+function stopAll() {
+  api('/api/stop-all', {method:'POST'}).catch(console.error);
+}
+
+function playDevice(ip) {
+  const file = document.getElementById('fileSelect').value;
+  if (!file) return;
+  api('/api/play', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'ip='+encodeURIComponent(ip)+'&file='+encodeURIComponent(file)}).catch(console.error);
+}
+
+function stopDevice(ip) {
+  api('/api/stop', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'ip='+encodeURIComponent(ip)}).catch(console.error);
+}
+
+loadInfo();
+loadFiles();
+loadNames();
+loadModes();
+loadClients();
+setInterval(() => { loadClients(); loadNames(); loadModes(); }, 2000);
+</script>
+</body>
+</html>
